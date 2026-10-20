@@ -1,0 +1,303 @@
+name: Build Windows11 Virtual Machine
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+
+      # =====================================
+      # 1. DOWNLOAD SOURCE CODE
+      # =====================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # =====================================
+      # 2. INSTALL PYTHON
+      # =====================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      # =====================================
+      # 3. INSTALL DEPENDENCIES
+      # =====================================
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # =====================================
+      # 4. INSTALL QEMU
+      # =====================================
+
+      - name: Install QEMU
+        run: |
+          choco install qemu -y --no-progress
+
+      # =====================================
+      # 5. LOCATE QEMU
+      # =====================================
+
+      - name: Locate QEMU
+        run: |
+          $paths = @(
+            "C:\Program Files\qemu",
+            "C:\Program Files (x86)\qemu"
+          )
+
+          $found = $null
+
+          foreach ($path in $paths) {
+            if (Test-Path "$path\qemu-system-x86_64.exe") {
+              $found = $path
+              break
+            }
+          }
+
+          if ($null -eq $found) {
+            throw "QEMU installation not found"
+          }
+
+          "QEMU_PATH=$found" >> $env:GITHUB_ENV
+
+          Write-Host "QEMU found: $found"
+
+      # =====================================
+      # 6. CREATE QEMU ZIP
+      # =====================================
+
+      - name: Create QEMU ZIP package
+        run: |
+          New-Item -ItemType Directory -Force -Path downloads
+
+          Compress-Archive `
+            -Path "$env:QEMU_PATH\*" `
+            -DestinationPath "downloads\qemu-windows-x64.zip" `
+            -CompressionLevel Optimal
+
+          if (!(Test-Path "downloads\qemu-windows-x64.zip")) {
+            throw "QEMU ZIP creation failed"
+          }
+
+      # =====================================
+      # 7. EXTRACT QEMU ZIP
+      # =====================================
+
+      - name: Extract QEMU ZIP
+        run: |
+          New-Item -ItemType Directory -Force -Path bundled-qemu
+
+          Expand-Archive `
+            -Path "downloads\qemu-windows-x64.zip" `
+            -DestinationPath "bundled-qemu" `
+            -Force
+
+          Write-Host "QEMU ZIP extracted successfully"
+
+      # =====================================
+      # 8. VERIFY EXTRACTED QEMU
+      # =====================================
+
+      - name: Verify extracted QEMU
+        run: |
+          $required = @(
+            "bundled-qemu\qemu-system-x86_64.exe",
+            "bundled-qemu\qemu-img.exe"
+          )
+
+          foreach ($file in $required) {
+            if (!(Test-Path $file)) {
+              throw "Missing QEMU component: $file"
+            }
+          }
+
+          Write-Host "QEMU files verified"
+
+      # =====================================
+      # 9. RUN TESTS
+      # =====================================
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -v
+
+      # =====================================
+      # 10. BUILD APPLICATION
+      # =====================================
+
+      - name: Build application with PyInstaller
+        run: |
+          python scripts/build.py
+
+      # =====================================
+      # 11. COPY QEMU INTO APPLICATION
+      # =====================================
+
+      - name: Bundle QEMU
+        run: |
+          $target = "dist\Windows11VirtualMachine\qemu"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $target
+
+          Copy-Item `
+            -Path "bundled-qemu\*" `
+            -Destination $target `
+            -Recurse `
+            -Force
+
+      # =====================================
+      # 12. VERIFY FINAL APPLICATION
+      # =====================================
+
+      - name: Verify application files
+        run: |
+          $root = "dist\Windows11VirtualMachine"
+
+          $required = @(
+            "$root\Windows11VirtualMachine.exe",
+            "$root\qemu\qemu-system-x86_64.exe",
+            "$root\qemu\qemu-img.exe"
+          )
+
+          foreach ($file in $required) {
+            if (!(Test-Path $file)) {
+              throw "Missing application component: $file"
+            }
+          }
+
+          Write-Host "Application package verified"
+
+      # =====================================
+      # 13. CREATE PORTABLE ZIP
+      # =====================================
+
+      - name: Create Portable ZIP
+        run: |
+          Compress-Archive `
+            -Path "dist\Windows11VirtualMachine\*" `
+            -DestinationPath "Windows11-VirtualMachine-Portable.zip" `
+            -CompressionLevel Optimal
+
+      # =====================================
+      # 14. INSTALL INNO SETUP
+      # =====================================
+
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup -y --no-progress
+
+      # =====================================
+      # 15. CREATE INSTALLER SCRIPT
+      # =====================================
+
+      - name: Create installer configuration
+        run: |
+          @'
+          [Setup]
+          AppName=Windows11 Virtual Machine
+          AppVersion=1.0.0
+          DefaultDirName={autopf}\Windows11VirtualMachine
+          DefaultGroupName=Windows11 Virtual Machine
+          OutputDir=.
+          OutputBaseFilename=Windows11-VirtualMachine-x64
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          UninstallDisplayIcon={app}\Windows11VirtualMachine.exe
+
+          [Files]
+          Source: "dist\Windows11VirtualMachine\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{group}\Windows11 Virtual Machine"; Filename: "{app}\Windows11VirtualMachine.exe"
+          Name: "{autodesktop}\Windows11 Virtual Machine"; Filename: "{app}\Windows11VirtualMachine.exe"
+
+          [Run]
+          Filename: "{app}\Windows11VirtualMachine.exe"; Description: "Launch Windows11 Virtual Machine"; Flags: nowait postinstall skipifsilent
+          '@ | Set-Content -Path installer.iss -Encoding UTF8
+
+      # =====================================
+      # 16. BUILD EXE INSTALLER
+      # =====================================
+
+      - name: Build EXE installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+
+          if (!(Test-Path $iscc)) {
+            throw "Inno Setup compiler not found"
+          }
+
+          & $iscc installer.iss
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installer build failed"
+          }
+
+      # =====================================
+      # 17. VERIFY RELEASE FILES
+      # =====================================
+
+      - name: Verify release artifacts
+        run: |
+          $files = @(
+            "Windows11-VirtualMachine-x64.exe",
+            "Windows11-VirtualMachine-Portable.zip"
+          )
+
+          foreach ($file in $files) {
+            if (!(Test-Path $file)) {
+              throw "Release artifact missing: $file"
+            }
+          }
+
+      # =====================================
+      # 18. UPLOAD ARTIFACTS
+      # =====================================
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows11-VirtualMachine-x64
+          path: |
+            Windows11-VirtualMachine-x64.exe
+            Windows11-VirtualMachine-Portable.zip
+
+      # =====================================
+      # 19. CREATE GITHUB RELEASE
+      # =====================================
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Windows11 Virtual Machine ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            Windows11-VirtualMachine-x64.exe
+            Windows11-VirtualMachine-Portable.zip
