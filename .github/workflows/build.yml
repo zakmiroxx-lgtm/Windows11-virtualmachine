@@ -1,11 +1,11 @@
 name: Build Windows11 Virtual Machine
 
 on:
+  workflow_dispatch:
+
   push:
     tags:
       - "v*"
-
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,81 +21,45 @@ jobs:
 
     steps:
 
-      # ==========================================
-      # 1. DOWNLOAD REPOSITORY
-      # ==========================================
+      # =====================================
+      # DOWNLOAD SOURCE
+      # =====================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ==========================================
-      # 2. FIND AND EXTRACT SOURCE ZIP
-      # ==========================================
+      # =====================================
+      # EXTRACT PROJECT ZIP
+      # =====================================
 
-      - name: Extract project ZIP
+      - name: Extract source archive
         run: |
-          Write-Host "Searching for project ZIP..."
-
-          $zipFiles = @(
-            Get-ChildItem `
-              -Path "." `
-              -Filter "*.zip" `
-              -File
+          $archives = @(
+            Get-ChildItem -Path . -Filter "*.zip" -File
           )
 
-          if ($zipFiles.Count -eq 0) {
-            throw "No ZIP archive found in repository root!"
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one source ZIP archive"
           }
 
-          if ($zipFiles.Count -gt 1) {
-            throw "Multiple ZIP files found. Keep only the project ZIP in the repository root."
-          }
+          $destination = Join-Path $env:RUNNER_TEMP "source"
 
-          $zip = $zipFiles[0]
-
-          Write-Host "Found ZIP: $($zip.FullName)"
-
-          $extractPath = Join-Path $env:RUNNER_TEMP "vm-project-source"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $extractPath | Out-Null
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
 
           Expand-Archive `
-            -LiteralPath $zip.FullName `
-            -DestinationPath $extractPath `
+            -LiteralPath $archives[0].FullName `
+            -DestinationPath $destination `
             -Force
-
-          Write-Host "ZIP extracted successfully."
-
-          Write-Host "Extracted files:"
-          Get-ChildItem -Path $extractPath -Recurse |
-            Select-Object FullName
-
-          "EXTRACT_PATH=$extractPath" >> $env:GITHUB_ENV
-
-      # ==========================================
-      # 3. FIND PROJECT ROOT
-      # ==========================================
-
-      - name: Locate project files
-        run: |
-          Write-Host "Locating requirements.txt..."
 
           $requirements = @(
             Get-ChildItem `
-              -Path $env:EXTRACT_PATH `
-              -Filter "requirements.txt" `
+              -Path $destination `
+              -Filter requirements.txt `
               -File `
               -Recurse
           )
 
-          if ($requirements.Count -eq 0) {
-            throw "requirements.txt not found inside ZIP!"
-          }
-
-          $validProjects = @(
+          $projects = @(
             $requirements | Where-Object {
               $root = $_.Directory.FullName
 
@@ -105,183 +69,130 @@ jobs:
             }
           )
 
-          if ($validProjects.Count -ne 1) {
-            throw "Expected exactly one complete project inside ZIP. Found: $($validProjects.Count)"
+          if ($projects.Count -ne 1) {
+            throw "Could not uniquely identify project root"
           }
 
-          $projectRoot = $validProjects[0].Directory.FullName
+          "PROJECT_ROOT=$($projects[0].Directory.FullName)" >> $env:GITHUB_ENV
 
-          Write-Host "Project root: $projectRoot"
-
-          "PROJECT_ROOT=$projectRoot" >> $env:GITHUB_ENV
-
-      # ==========================================
-      # 4. SETUP PYTHON
-      # ==========================================
+      # =====================================
+      # PYTHON
+      # =====================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          architecture: "x64"
+          architecture: x64
 
-      # ==========================================
-      # 5. INSTALL PYTHON DEPENDENCIES
-      # ==========================================
-
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           Set-Location $env:PROJECT_ROOT
-
-          Write-Host "Installing dependencies..."
 
           python -m pip install --upgrade pip
 
           python -m pip install -r requirements.txt
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Python dependency installation failed"
+            throw "Dependency installation failed"
           }
 
-      # ==========================================
-      # 6. INSTALL QEMU
-      # ==========================================
+      # =====================================
+      # QEMU
+      # =====================================
 
       - name: Install QEMU
         run: |
-          choco install qemu -y --no-progress
+          choco install qemu -y --no-progress --limit-output
 
           if ($LASTEXITCODE -ne 0) {
             throw "QEMU installation failed"
           }
 
-      # ==========================================
-      # 7. LOCATE QEMU
-      # ==========================================
-
-      - name: Locate QEMU installation
+      - name: Locate QEMU
         run: |
-          $paths = @(
+          $locations = @(
             "C:\Program Files\qemu",
             "C:\Program Files (x86)\qemu"
           )
 
           $found = $null
 
-          foreach ($path in $paths) {
-            if (Test-Path (Join-Path $path "qemu-system-x86_64.exe")) {
-              $found = $path
+          foreach ($location in $locations) {
+            if (
+              (Test-Path (Join-Path $location "qemu-system-x86_64.exe")) -and
+              (Test-Path (Join-Path $location "qemu-img.exe"))
+            ) {
+              $found = $location
               break
             }
           }
 
-          if ($null -eq $found) {
-            throw "QEMU executable not found!"
+          if (!$found) {
+            throw "QEMU not found"
           }
-
-          if (!(Test-Path (Join-Path $found "qemu-img.exe"))) {
-            throw "qemu-img.exe not found!"
-          }
-
-          Write-Host "QEMU found: $found"
 
           "QEMU_PATH=$found" >> $env:GITHUB_ENV
 
-      # ==========================================
-      # 8. RUN AUTOMATIC TESTS
-      # ==========================================
+      # =====================================
+      # TESTS
+      # =====================================
 
-      - name: Run project tests
+      - name: Run tests
         run: |
           Set-Location $env:PROJECT_ROOT
 
-          if (Test-Path "tests") {
-            python -m unittest discover -s tests -v
+          python -m unittest discover -s tests -v
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "Tests failed"
-            }
-          }
-          else {
-            throw "Tests directory not found!"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tests failed"
           }
 
-      # ==========================================
-      # 9. BUILD PYTHON APPLICATION
-      # ==========================================
+      # =====================================
+      # BUILD
+      # =====================================
 
       - name: Build application
         run: |
           Set-Location $env:PROJECT_ROOT
 
-          Write-Host "Building application..."
-
-          python scripts/build.py
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --windowed `
+            --onedir `
+            --noupx `
+            --name Windows11VirtualMachine `
+            --paths . `
+            launcher.py
 
           if ($LASTEXITCODE -ne 0) {
-            throw "PyInstaller build failed"
+            throw "Application build failed"
           }
 
-          $exe = "dist\Windows11VirtualMachine\Windows11VirtualMachine.exe"
+      # =====================================
+      # BUNDLE QEMU
+      # =====================================
 
-          if (!(Test-Path $exe)) {
-            throw "Application EXE not found!"
-          }
-
-          Write-Host "Application built successfully."
-
-      # ==========================================
-      # 10. CREATE QEMU ZIP
-      # ==========================================
-
-      - name: Package QEMU into ZIP
-        run: |
-          $zipPath = Join-Path $env:RUNNER_TEMP "qemu-windows-x64.zip"
-
-          if (Test-Path $zipPath) {
-            Remove-Item $zipPath -Force
-          }
-
-          Compress-Archive `
-            -Path "$env:QEMU_PATH\*" `
-            -DestinationPath $zipPath `
-            -CompressionLevel Optimal
-
-          if (!(Test-Path $zipPath)) {
-            throw "QEMU ZIP creation failed!"
-          }
-
-          "QEMU_ZIP=$zipPath" >> $env:GITHUB_ENV
-
-          Write-Host "QEMU ZIP created."
-
-      # ==========================================
-      # 11. EXTRACT QEMU INTO APPLICATION
-      # ==========================================
-
-      - name: Extract QEMU ZIP into application
+      - name: Bundle QEMU
         run: |
           $target = Join-Path `
             $env:PROJECT_ROOT `
             "dist\Windows11VirtualMachine\qemu"
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $target | Out-Null
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
 
-          Expand-Archive `
-            -LiteralPath $env:QEMU_ZIP `
-            -DestinationPath $target `
+          Copy-Item `
+            -Path "$env:QEMU_PATH\*" `
+            -Destination $target `
+            -Recurse `
             -Force
 
-          Write-Host "QEMU extracted into application."
+      # =====================================
+      # VERIFY BUILD
+      # =====================================
 
-      # ==========================================
-      # 12. VERIFY BUNDLED COMPONENTS
-      # ==========================================
-
-      - name: Verify application components
+      - name: Verify required files
         run: |
           $root = Join-Path `
             $env:PROJECT_ROOT `
@@ -297,43 +208,52 @@ jobs:
             $path = Join-Path $root $file
 
             if (!(Test-Path $path)) {
-              throw "Missing required component: $file"
+              throw "Missing component: $file"
             }
-
-            Write-Host "OK: $file"
           }
 
-          Write-Host "All required files found."
+          "PACKAGE_ROOT=$root" >> $env:GITHUB_ENV
 
-      # ==========================================
-      # 13. CREATE PORTABLE ZIP
-      # ==========================================
+      # =====================================
+      # WINDOWS DEFENDER SCAN
+      # =====================================
+
+      - name: Scan application with Microsoft Defender
+        run: |
+          $defender = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+
+          if (!(Test-Path $defender)) {
+            throw "Microsoft Defender scanner unavailable"
+          }
+
+          & $defender `
+            -Scan `
+            -ScanType 3 `
+            -File $env:PACKAGE_ROOT
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Defender scan failed or detected a threat"
+          }
+
+      # =====================================
+      # PORTABLE PACKAGE
+      # =====================================
 
       - name: Create portable ZIP
         run: |
-          $source = Join-Path `
-            $env:PROJECT_ROOT `
-            "dist\Windows11VirtualMachine"
-
           $destination = Join-Path `
             $env:GITHUB_WORKSPACE `
             "Windows11-VirtualMachine-Portable.zip"
 
           Compress-Archive `
-            -Path "$source\*" `
+            -Path "$env:PACKAGE_ROOT\*" `
             -DestinationPath $destination `
             -CompressionLevel Optimal `
             -Force
 
-          if (!(Test-Path $destination)) {
-            throw "Portable ZIP creation failed!"
-          }
-
-          Write-Host "Portable ZIP created."
-
-      # ==========================================
-      # 14. INSTALL INNO SETUP
-      # ==========================================
+      # =====================================
+      # INNO SETUP
+      # =====================================
 
       - name: Install Inno Setup
         run: |
@@ -343,18 +263,16 @@ jobs:
             throw "Inno Setup installation failed"
           }
 
-      # ==========================================
-      # 15. CREATE INSTALLER CONFIGURATION
-      # ==========================================
-
-      - name: Generate installer script
+      - name: Create installer configuration
         run: |
           Set-Location $env:PROJECT_ROOT
 
           @'
           [Setup]
+          AppId=Windows11VirtualMachine
           AppName=Windows11 Virtual Machine
           AppVersion=1.0.0
+          AppPublisher=Windows11 Virtual Machine Contributors
           DefaultDirName={autopf}\Windows11VirtualMachine
           DefaultGroupName=Windows11 Virtual Machine
           OutputDir=.
@@ -364,58 +282,72 @@ jobs:
           ArchitecturesAllowed=x64compatible
           ArchitecturesInstallIn64BitMode=x64compatible
           UninstallDisplayIcon={app}\Windows11VirtualMachine.exe
+          PrivilegesRequired=lowest
 
           [Files]
           Source: "dist\Windows11VirtualMachine\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 
           [Icons]
           Name: "{group}\Windows11 Virtual Machine"; Filename: "{app}\Windows11VirtualMachine.exe"
-          Name: "{autodesktop}\Windows11 Virtual Machine"; Filename: "{app}\Windows11VirtualMachine.exe"
+          Name: "{autodesktop}\Windows11 Virtual Machine"; Filename: "{app}\Windows11VirtualMachine.exe"; Tasks: desktopicon
 
-          [Run]
-          Filename: "{app}\Windows11VirtualMachine.exe"; Description: "Launch Windows11 Virtual Machine"; Flags: nowait postinstall skipifsilent
-          '@ | Set-Content -Path "installer.iss" -Encoding UTF8
+          [Tasks]
+          Name: desktopicon; Description: "Create desktop shortcut"; GroupDescription: "Additional icons:"
+          '@ | Set-Content installer.iss -Encoding UTF8
 
-          Write-Host "Installer script created."
+      # =====================================
+      # CREATE INSTALLER
+      # =====================================
 
-      # ==========================================
-      # 16. BUILD EXE INSTALLER
-      # ==========================================
-
-      - name: Build Windows EXE installer
+      - name: Build installer
         run: |
           Set-Location $env:PROJECT_ROOT
 
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 
-          if (!(Test-Path $iscc)) {
-            throw "Inno Setup compiler not found!"
+          if (!(Test-Path $compiler)) {
+            throw "Inno Setup compiler missing"
           }
 
-          & $iscc "installer.iss"
+          & $compiler installer.iss
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Installer compilation failed!"
-          }
-
-          $installer = "Windows11-VirtualMachine-x64.exe"
-
-          if (!(Test-Path $installer)) {
-            throw "Installer EXE not found!"
+            throw "Installer compilation failed"
           }
 
           Copy-Item `
-            -Path $installer `
-            -Destination $env:GITHUB_WORKSPACE `
+            "Windows11-VirtualMachine-x64.exe" `
+            $env:GITHUB_WORKSPACE `
             -Force
 
-          Write-Host "Windows installer created."
+      # =====================================
+      # SCAN FINAL INSTALLER
+      # =====================================
 
-      # ==========================================
-      # 17. VERIFY FINAL RELEASE FILES
-      # ==========================================
+      - name: Scan final installer
+        run: |
+          $installer = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "Windows11-VirtualMachine-x64.exe"
 
-      - name: Verify release files
+          $defender = Join-Path `
+            $env:ProgramFiles `
+            "Windows Defender\MpCmdRun.exe"
+
+          & $defender `
+            -Scan `
+            -ScanType 3 `
+            -File $installer
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Final installer failed security scan"
+          }
+
+      # =====================================
+      # SHA256 CHECKSUMS
+      # =====================================
+
+      - name: Generate SHA256 checksums
         run: |
           Set-Location $env:GITHUB_WORKSPACE
 
@@ -424,21 +356,27 @@ jobs:
             "Windows11-VirtualMachine-Portable.zip"
           )
 
-          foreach ($file in $files) {
+          $checksums = foreach ($file in $files) {
             if (!(Test-Path $file)) {
-              throw "Release file missing: $file"
+              throw "Missing artifact: $file"
             }
 
-            $size = (Get-Item $file).Length / 1MB
+            $hash = Get-FileHash `
+              -Path $file `
+              -Algorithm SHA256
 
-            Write-Host "$file - $([math]::Round($size, 2)) MB"
+            "$($hash.Hash.ToLower())  $file"
           }
 
-          Write-Host "Release artifacts verified."
+          $checksums | Set-Content `
+            -Path "SHA256SUMS.txt" `
+            -Encoding ascii
 
-      # ==========================================
-      # 18. UPLOAD ARTIFACTS
-      # ==========================================
+          Get-Content SHA256SUMS.txt
+
+      # =====================================
+      # UPLOAD ARTIFACTS
+      # =====================================
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -447,19 +385,20 @@ jobs:
           path: |
             Windows11-VirtualMachine-x64.exe
             Windows11-VirtualMachine-Portable.zip
+            SHA256SUMS.txt
           if-no-files-found: error
 
-      # ==========================================
-      # 19. PUBLISH GITHUB RELEASE
-      # ==========================================
+      # =====================================
+      # GITHUB RELEASE
+      # =====================================
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: Windows11 Virtual Machine ${{ github.ref_name }}
           generate_release_notes: true
           files: |
             Windows11-VirtualMachine-x64.exe
             Windows11-VirtualMachine-Portable.zip
+            SHA256SUMS.txt
           fail_on_unmatched_files: true
