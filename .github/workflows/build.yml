@@ -21,16 +21,103 @@ jobs:
 
     steps:
 
-      # =====================================
-      # 1. DOWNLOAD SOURCE CODE
-      # =====================================
+      # ==========================================
+      # 1. DOWNLOAD REPOSITORY
+      # ==========================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # =====================================
-      # 2. INSTALL PYTHON
-      # =====================================
+      # ==========================================
+      # 2. FIND AND EXTRACT SOURCE ZIP
+      # ==========================================
+
+      - name: Extract project ZIP
+        run: |
+          Write-Host "Searching for project ZIP..."
+
+          $zipFiles = @(
+            Get-ChildItem `
+              -Path "." `
+              -Filter "*.zip" `
+              -File
+          )
+
+          if ($zipFiles.Count -eq 0) {
+            throw "No ZIP archive found in repository root!"
+          }
+
+          if ($zipFiles.Count -gt 1) {
+            throw "Multiple ZIP files found. Keep only the project ZIP in the repository root."
+          }
+
+          $zip = $zipFiles[0]
+
+          Write-Host "Found ZIP: $($zip.FullName)"
+
+          $extractPath = Join-Path $env:RUNNER_TEMP "vm-project-source"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $extractPath | Out-Null
+
+          Expand-Archive `
+            -LiteralPath $zip.FullName `
+            -DestinationPath $extractPath `
+            -Force
+
+          Write-Host "ZIP extracted successfully."
+
+          Write-Host "Extracted files:"
+          Get-ChildItem -Path $extractPath -Recurse |
+            Select-Object FullName
+
+          "EXTRACT_PATH=$extractPath" >> $env:GITHUB_ENV
+
+      # ==========================================
+      # 3. FIND PROJECT ROOT
+      # ==========================================
+
+      - name: Locate project files
+        run: |
+          Write-Host "Locating requirements.txt..."
+
+          $requirements = @(
+            Get-ChildItem `
+              -Path $env:EXTRACT_PATH `
+              -Filter "requirements.txt" `
+              -File `
+              -Recurse
+          )
+
+          if ($requirements.Count -eq 0) {
+            throw "requirements.txt not found inside ZIP!"
+          }
+
+          $validProjects = @(
+            $requirements | Where-Object {
+              $root = $_.Directory.FullName
+
+              (Test-Path (Join-Path $root "launcher.py")) -and
+              (Test-Path (Join-Path $root "scripts\build.py")) -and
+              (Test-Path (Join-Path $root "src\main.py"))
+            }
+          )
+
+          if ($validProjects.Count -ne 1) {
+            throw "Expected exactly one complete project inside ZIP. Found: $($validProjects.Count)"
+          }
+
+          $projectRoot = $validProjects[0].Directory.FullName
+
+          Write-Host "Project root: $projectRoot"
+
+          "PROJECT_ROOT=$projectRoot" >> $env:GITHUB_ENV
+
+      # ==========================================
+      # 4. SETUP PYTHON
+      # ==========================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,28 +125,41 @@ jobs:
           python-version: "3.12"
           architecture: "x64"
 
-      # =====================================
-      # 3. INSTALL DEPENDENCIES
-      # =====================================
+      # ==========================================
+      # 5. INSTALL PYTHON DEPENDENCIES
+      # ==========================================
 
       - name: Install Python dependencies
         run: |
+          Set-Location $env:PROJECT_ROOT
+
+          Write-Host "Installing dependencies..."
+
           python -m pip install --upgrade pip
+
           python -m pip install -r requirements.txt
 
-      # =====================================
-      # 4. INSTALL QEMU
-      # =====================================
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python dependency installation failed"
+          }
+
+      # ==========================================
+      # 6. INSTALL QEMU
+      # ==========================================
 
       - name: Install QEMU
         run: |
           choco install qemu -y --no-progress
 
-      # =====================================
-      # 5. LOCATE QEMU
-      # =====================================
+          if ($LASTEXITCODE -ne 0) {
+            throw "QEMU installation failed"
+          }
 
-      - name: Locate QEMU
+      # ==========================================
+      # 7. LOCATE QEMU
+      # ==========================================
+
+      - name: Locate QEMU installation
         run: |
           $paths = @(
             "C:\Program Files\qemu",
@@ -69,153 +169,188 @@ jobs:
           $found = $null
 
           foreach ($path in $paths) {
-            if (Test-Path "$path\qemu-system-x86_64.exe") {
+            if (Test-Path (Join-Path $path "qemu-system-x86_64.exe")) {
               $found = $path
               break
             }
           }
 
           if ($null -eq $found) {
-            throw "QEMU installation not found"
+            throw "QEMU executable not found!"
           }
 
-          "QEMU_PATH=$found" >> $env:GITHUB_ENV
+          if (!(Test-Path (Join-Path $found "qemu-img.exe"))) {
+            throw "qemu-img.exe not found!"
+          }
 
           Write-Host "QEMU found: $found"
 
-      # =====================================
-      # 6. CREATE QEMU ZIP
-      # =====================================
+          "QEMU_PATH=$found" >> $env:GITHUB_ENV
 
-      - name: Create QEMU ZIP package
+      # ==========================================
+      # 8. RUN AUTOMATIC TESTS
+      # ==========================================
+
+      - name: Run project tests
         run: |
-          New-Item -ItemType Directory -Force -Path downloads
+          Set-Location $env:PROJECT_ROOT
+
+          if (Test-Path "tests") {
+            python -m unittest discover -s tests -v
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Tests failed"
+            }
+          }
+          else {
+            throw "Tests directory not found!"
+          }
+
+      # ==========================================
+      # 9. BUILD PYTHON APPLICATION
+      # ==========================================
+
+      - name: Build application
+        run: |
+          Set-Location $env:PROJECT_ROOT
+
+          Write-Host "Building application..."
+
+          python scripts/build.py
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyInstaller build failed"
+          }
+
+          $exe = "dist\Windows11VirtualMachine\Windows11VirtualMachine.exe"
+
+          if (!(Test-Path $exe)) {
+            throw "Application EXE not found!"
+          }
+
+          Write-Host "Application built successfully."
+
+      # ==========================================
+      # 10. CREATE QEMU ZIP
+      # ==========================================
+
+      - name: Package QEMU into ZIP
+        run: |
+          $zipPath = Join-Path $env:RUNNER_TEMP "qemu-windows-x64.zip"
+
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
 
           Compress-Archive `
             -Path "$env:QEMU_PATH\*" `
-            -DestinationPath "downloads\qemu-windows-x64.zip" `
+            -DestinationPath $zipPath `
             -CompressionLevel Optimal
 
-          if (!(Test-Path "downloads\qemu-windows-x64.zip")) {
-            throw "QEMU ZIP creation failed"
+          if (!(Test-Path $zipPath)) {
+            throw "QEMU ZIP creation failed!"
           }
 
-      # =====================================
-      # 7. EXTRACT QEMU ZIP
-      # =====================================
+          "QEMU_ZIP=$zipPath" >> $env:GITHUB_ENV
 
-      - name: Extract QEMU ZIP
+          Write-Host "QEMU ZIP created."
+
+      # ==========================================
+      # 11. EXTRACT QEMU INTO APPLICATION
+      # ==========================================
+
+      - name: Extract QEMU ZIP into application
         run: |
-          New-Item -ItemType Directory -Force -Path bundled-qemu
-
-          Expand-Archive `
-            -Path "downloads\qemu-windows-x64.zip" `
-            -DestinationPath "bundled-qemu" `
-            -Force
-
-          Write-Host "QEMU ZIP extracted successfully"
-
-      # =====================================
-      # 8. VERIFY EXTRACTED QEMU
-      # =====================================
-
-      - name: Verify extracted QEMU
-        run: |
-          $required = @(
-            "bundled-qemu\qemu-system-x86_64.exe",
-            "bundled-qemu\qemu-img.exe"
-          )
-
-          foreach ($file in $required) {
-            if (!(Test-Path $file)) {
-              throw "Missing QEMU component: $file"
-            }
-          }
-
-          Write-Host "QEMU files verified"
-
-      # =====================================
-      # 9. RUN TESTS
-      # =====================================
-
-      - name: Run unit tests
-        run: |
-          python -m unittest discover -s tests -v
-
-      # =====================================
-      # 10. BUILD APPLICATION
-      # =====================================
-
-      - name: Build application with PyInstaller
-        run: |
-          python scripts/build.py
-
-      # =====================================
-      # 11. COPY QEMU INTO APPLICATION
-      # =====================================
-
-      - name: Bundle QEMU
-        run: |
-          $target = "dist\Windows11VirtualMachine\qemu"
+          $target = Join-Path `
+            $env:PROJECT_ROOT `
+            "dist\Windows11VirtualMachine\qemu"
 
           New-Item `
             -ItemType Directory `
             -Force `
-            -Path $target
+            -Path $target | Out-Null
 
-          Copy-Item `
-            -Path "bundled-qemu\*" `
-            -Destination $target `
-            -Recurse `
+          Expand-Archive `
+            -LiteralPath $env:QEMU_ZIP `
+            -DestinationPath $target `
             -Force
 
-      # =====================================
-      # 12. VERIFY FINAL APPLICATION
-      # =====================================
+          Write-Host "QEMU extracted into application."
 
-      - name: Verify application files
+      # ==========================================
+      # 12. VERIFY BUNDLED COMPONENTS
+      # ==========================================
+
+      - name: Verify application components
         run: |
-          $root = "dist\Windows11VirtualMachine"
+          $root = Join-Path `
+            $env:PROJECT_ROOT `
+            "dist\Windows11VirtualMachine"
 
           $required = @(
-            "$root\Windows11VirtualMachine.exe",
-            "$root\qemu\qemu-system-x86_64.exe",
-            "$root\qemu\qemu-img.exe"
+            "Windows11VirtualMachine.exe",
+            "qemu\qemu-system-x86_64.exe",
+            "qemu\qemu-img.exe"
           )
 
           foreach ($file in $required) {
-            if (!(Test-Path $file)) {
-              throw "Missing application component: $file"
+            $path = Join-Path $root $file
+
+            if (!(Test-Path $path)) {
+              throw "Missing required component: $file"
             }
+
+            Write-Host "OK: $file"
           }
 
-          Write-Host "Application package verified"
+          Write-Host "All required files found."
 
-      # =====================================
+      # ==========================================
       # 13. CREATE PORTABLE ZIP
-      # =====================================
+      # ==========================================
 
-      - name: Create Portable ZIP
+      - name: Create portable ZIP
         run: |
-          Compress-Archive `
-            -Path "dist\Windows11VirtualMachine\*" `
-            -DestinationPath "Windows11-VirtualMachine-Portable.zip" `
-            -CompressionLevel Optimal
+          $source = Join-Path `
+            $env:PROJECT_ROOT `
+            "dist\Windows11VirtualMachine"
 
-      # =====================================
+          $destination = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "Windows11-VirtualMachine-Portable.zip"
+
+          Compress-Archive `
+            -Path "$source\*" `
+            -DestinationPath $destination `
+            -CompressionLevel Optimal `
+            -Force
+
+          if (!(Test-Path $destination)) {
+            throw "Portable ZIP creation failed!"
+          }
+
+          Write-Host "Portable ZIP created."
+
+      # ==========================================
       # 14. INSTALL INNO SETUP
-      # =====================================
+      # ==========================================
 
       - name: Install Inno Setup
         run: |
           choco install innosetup -y --no-progress
 
-      # =====================================
-      # 15. CREATE INSTALLER SCRIPT
-      # =====================================
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup installation failed"
+          }
 
-      - name: Create installer configuration
+      # ==========================================
+      # 15. CREATE INSTALLER CONFIGURATION
+      # ==========================================
+
+      - name: Generate installer script
         run: |
+          Set-Location $env:PROJECT_ROOT
+
           @'
           [Setup]
           AppName=Windows11 Virtual Machine
@@ -239,32 +374,51 @@ jobs:
 
           [Run]
           Filename: "{app}\Windows11VirtualMachine.exe"; Description: "Launch Windows11 Virtual Machine"; Flags: nowait postinstall skipifsilent
-          '@ | Set-Content -Path installer.iss -Encoding UTF8
+          '@ | Set-Content -Path "installer.iss" -Encoding UTF8
 
-      # =====================================
+          Write-Host "Installer script created."
+
+      # ==========================================
       # 16. BUILD EXE INSTALLER
-      # =====================================
+      # ==========================================
 
-      - name: Build EXE installer
+      - name: Build Windows EXE installer
         run: |
+          Set-Location $env:PROJECT_ROOT
+
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 
           if (!(Test-Path $iscc)) {
-            throw "Inno Setup compiler not found"
+            throw "Inno Setup compiler not found!"
           }
 
-          & $iscc installer.iss
+          & $iscc "installer.iss"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Installer build failed"
+            throw "Installer compilation failed!"
           }
 
-      # =====================================
-      # 17. VERIFY RELEASE FILES
-      # =====================================
+          $installer = "Windows11-VirtualMachine-x64.exe"
 
-      - name: Verify release artifacts
+          if (!(Test-Path $installer)) {
+            throw "Installer EXE not found!"
+          }
+
+          Copy-Item `
+            -Path $installer `
+            -Destination $env:GITHUB_WORKSPACE `
+            -Force
+
+          Write-Host "Windows installer created."
+
+      # ==========================================
+      # 17. VERIFY FINAL RELEASE FILES
+      # ==========================================
+
+      - name: Verify release files
         run: |
+          Set-Location $env:GITHUB_WORKSPACE
+
           $files = @(
             "Windows11-VirtualMachine-x64.exe",
             "Windows11-VirtualMachine-Portable.zip"
@@ -272,25 +426,32 @@ jobs:
 
           foreach ($file in $files) {
             if (!(Test-Path $file)) {
-              throw "Release artifact missing: $file"
+              throw "Release file missing: $file"
             }
+
+            $size = (Get-Item $file).Length / 1MB
+
+            Write-Host "$file - $([math]::Round($size, 2)) MB"
           }
 
-      # =====================================
-      # 18. UPLOAD ARTIFACTS
-      # =====================================
+          Write-Host "Release artifacts verified."
 
-      - name: Upload build artifacts
+      # ==========================================
+      # 18. UPLOAD ARTIFACTS
+      # ==========================================
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Windows11-VirtualMachine-x64
+          name: Windows11-VirtualMachine
           path: |
             Windows11-VirtualMachine-x64.exe
             Windows11-VirtualMachine-Portable.zip
+          if-no-files-found: error
 
-      # =====================================
-      # 19. CREATE GITHUB RELEASE
-      # =====================================
+      # ==========================================
+      # 19. PUBLISH GITHUB RELEASE
+      # ==========================================
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -301,3 +462,4 @@ jobs:
           files: |
             Windows11-VirtualMachine-x64.exe
             Windows11-VirtualMachine-Portable.zip
+          fail_on_unmatched_files: true
